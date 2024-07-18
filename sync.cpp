@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include <vector>
 
+#include <iostream>
+#include <fstream>
+std::ofstream out("txxxxt.txt")
+
 #include <libcamera/base/log.h>
 
 #include "sync_status.h"
@@ -126,10 +130,6 @@ void Sync::switchMode([[maybe_unused]] CameraMode const &cameraMode, [[maybe_unu
 	readyCountdown_ = 0;
 }
 
-/* My things */
-bool corrected = false;
-std::chrono::microseconds errr= std::chrono::microseconds(0);
-
 /* Most important part, algorithm*/
 void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadata)
 {
@@ -183,10 +183,12 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 						<< " : next seq " << lastPayload_.nextSequence << " ts " << lastPayload_.nextWallClock
 						<< " est duration " << (lastPayload_.nextWallClock - lastPayload_.wallClock) * 1us / (lastPayload_.nextSequence - lastPayload_.sequence)
 						<< " : readyFrame " << lastPayload_.readyFrame;
-					/*state_ = State::Correcting;*/
+					state_ = State::Correcting;
 					frames = 0;						
 
 					if (!syncReady_)
+					//we have two different frame counts for the two different cameras, eahc running its own
+					//this readyCountdown will not be constant becaue we sometimes skip a frame or two
 						readyCountdown_ = lastPayload_.readyFrame + frameCount_;
 
 				} else
@@ -199,21 +201,8 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		std::chrono::microseconds delta_mod_1 = delta - mul * lastPayloadFrameDuration;
 		std::chrono::microseconds delta_mod = delta - 1* lastPayloadFrameDuration; 
 
-		if(! corrected && abs(delta_mod_1) < 100us) {
-			corrected = true;
-			errr= delta_mod_1;
-		}
-
-
 		if(frames == 0){
-			if(!corrected){
-						state_ = State::Correcting;
-					} else{
-						errr= errr /10 + delta_mod_1 *9/10;
-					}
-
-
-			LOG(RPiSync, Info)<<"delta: "<<delta<<" Last payload "<<lastPayloadFrameDuration<<" error         "<<errr<<"       dela mod "<<delta_mod_1;
+			LOG(RPiSync, Info) << "Current frame : seq " << local.sequence << " ready countdown " << readyCountdown_;
 		}
 		/* SPAM
 			LOG(RPiSync, Info) << "Current frame : seq " << local.sequence << " ts " << local.wallClock << "us"
@@ -222,18 +211,21 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		if (state_ == State::Correcting)  {
 			status.frameDurationOffset = delta_mod;
 			state_ = State::Stabilising;
-			LOG(RPiSync, Info) << "Correcting offset " << status.frameDurationOffset;
+			LOG(RPiSync, Info) << "Correcting offset " << delta_mod_1;
 
 		} else if (state_ == State::Stabilising) {
 			status.frameDurationOffset = 0s;
-			LOG(RPiSync, Info) << "Stabilising duration ";		
+			/*LOG(RPiSync, Info) << "Stabilising duration ";*/		
 			state_ = State::Idle;
 		}
 
 		if (!syncReady_ && readyCountdown_ && !(readyCountdown_ - frameCount_)) {
 			syncReady_ = true;
 			LOG(RPiSync, Info) << "Sync ready at frame " << frameCount_ << " ts " <<  payload.wallClock;
-		}				
+		}		
+		if (syncReady_){
+			out<< delta_mod << " " << local.sequence; 
+		}		
 
 		frames++;
 	}
