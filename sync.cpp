@@ -14,9 +14,6 @@
 #include <unistd.h>
 #include <vector>
 
-#include <iostream>
-#include <fstream>
-std::ofstream out("txxxxt.txt")
 
 #include <libcamera/base/log.h>
 
@@ -224,7 +221,7 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 			LOG(RPiSync, Info) << "Sync ready at frame " << frameCount_ << " ts " <<  payload.wallClock;
 		}		
 		if (syncReady_){
-			out<< delta_mod << " " << local.sequence; 
+			//out<< delta_mod << " " << local.sequence; 
 		}		
 
 		frames++;
