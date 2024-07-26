@@ -1,9 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
-/*
- * Copyright (C) 2019-2021, Raspberry Pi Ltd
- *
- * sdn.cpp - SDN (spatial denoise) control algorithm
- */
 #include "sync.h"
 
 #include <cctype>
@@ -13,12 +7,13 @@
 #include <strings.h>
 #include <unistd.h>
 #include <vector>
-
+#include<list>
 
 #include <libcamera/base/log.h>
 
 #include "sync_status.h"
 
+using namespace std;
 using namespace std::chrono_literals;
 using namespace RPiController;
 using namespace libcamera;
@@ -31,6 +26,7 @@ const char *DefaultGroup = "239.255.255.250";
 constexpr unsigned int DefaultPort = 10000;
 constexpr unsigned int DefaultSyncPeriod = 30;
 constexpr unsigned int DefaultReadyFrame = 1000;
+constexpr unsigned int DefaultSufficientSync = 10;
 
 Sync::Sync(Controller *controller)
 	: SyncAlgorithm(controller), mode_(Mode::Off), socket_(-1), frameDuration_(0s), frameCount_(0)
@@ -71,6 +67,7 @@ int Sync::read(const libcamera::YamlObject &params)
 	port_ = params["port"].get<uint16_t>(DefaultPort);
 	syncPeriod_ = params["sync_period"].get<uint32_t>(DefaultSyncPeriod);
 	readyFrame_ = params["ready_frame"].get<uint32_t>(DefaultReadyFrame);
+	sufficientSync_ = params["sufficient_sync"].get<uint32_t>(DefaultSufficientSync);
 
 	return 0;
 }
@@ -125,7 +122,41 @@ void Sync::switchMode([[maybe_unused]] CameraMode const &cameraMode, [[maybe_unu
 	syncReady_ = false;
 	frameCount_ = 0;
 	readyCountdown_ = 0;
+	syncCount_ = 0;
 }
+
+
+float slope(list<int> a, list<int> b){
+
+	list<int>::iterator ita = a.begin();
+	list<int>::iterator itb = b.begin();
+
+	double xsum = 0, ysum = 0, xysum = 0, x2sum = 0;
+	for(; ita != a.end() && itb != b.end(); ita++ , itb++){
+		xsum = xsum + *ita * 1.0;
+		ysum = ysum + (*itb) * 1.0;
+		xysum = xysum + *ita * (*itb) * 1.0;
+		x2sum = x2sum + *ita * *ita * 1.0;
+	}
+	double sl = (a.size() * xysum - xsum * ysum)/(a.size() * x2sum - xsum * xsum) ;
+	if(sl){return sl;} else {return 0;}
+}
+
+list<int> updating_trend(list<int> a, int b){
+
+	list<int>::iterator it = a.begin();
+	list<int> update;
+
+	for(; it != a.end(); it++){
+		update.push_back((*it)-b);
+	}
+	return update;
+}
+
+
+list<int> xpoints;
+list<int> ypoints;
+
 
 /* Most important part, algorithm*/
 void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadata)
@@ -147,7 +178,7 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 			syncReady_ = true;
 		}
 
-		if (!(frameCount_ % syncPeriod_) && !syncReady_) {
+		if (!(frameCount_ % syncPeriod_)) {
 			static int lastWallClock = local.wallClock;
 			payload.sequence = local.sequence;
 			payload.wallClock = local.wallClock;
@@ -165,7 +196,9 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 						<< " : next seq " << payload.nextSequence << " ts " << payload.nextWallClock << " : ready frame " << payload.readyFrame;
 		}
 	} else if (mode_ == Mode::Client) {
-
+		int jitter = 0;
+		int trending = 0;
+		std::chrono::microseconds delta_mod = 0us;
 		static int frames = 0;
 		socklen_t addrlen = sizeof(addr_);
 
@@ -174,56 +207,81 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 			int ret = recvfrom(socket_, &lastPayload_, sizeof(lastPayload_), 0, (struct sockaddr *)&addr_, &addrlen);
 
 			if (ret > 0) {
-				int jitter = lastPayload_.wallClock - lastWallClock;
-				LOG(RPiSync, Info) << "Receive message: seq " << lastPayload_.sequence << " ts " << lastPayload_.wallClock
-						<< " server jitter " << jitter << "us"
-						<< " : next seq " << lastPayload_.nextSequence << " ts " << lastPayload_.nextWallClock
-						<< " est duration " << (lastPayload_.nextWallClock - lastPayload_.wallClock) * 1us / (lastPayload_.nextSequence - lastPayload_.sequence)
-						<< " : readyFrame " << lastPayload_.readyFrame;
-					state_ = State::Correcting;
-					frames = 0;						
+				jitter = lastPayload_.wallClock - lastWallClock;
 
-					if (!syncReady_)
-					//we have two different frame counts for the two different cameras, eahc running its own
-					//this readyCountdown will not be constant becaue we sometimes skip a frame or two
-						readyCountdown_ = lastPayload_.readyFrame + frameCount_;
+				/* Approximates frame duration */
+				std::chrono::microseconds lastPayloadFrameDuration = (lastPayload_.nextWallClock - lastPayload_.wallClock) * 1us / (lastPayload_.nextSequence - lastPayload_.sequence);
+				std::chrono::microseconds delta = (local.wallClock * 1us) - ((lastPayload_.wallClock * 1us) + frames * lastPayloadFrameDuration);
+				unsigned int mul = (delta + lastPayloadFrameDuration / 2) / lastPayloadFrameDuration;
+				delta_mod = delta - mul * lastPayloadFrameDuration;
+				
+				if(jitter < 5000 && !syncReady_){
+					state_ = State::Correcting;
+					syncCount_++;
+				}
+				frames = 0;					
+
+				if (!syncReady_)
+					readyCountdown_ = lastPayload_.readyFrame + frameCount_;
 
 				} else
 					break;
 		}
+
 		/* Approximates frame duration */
 		std::chrono::microseconds lastPayloadFrameDuration = (lastPayload_.nextWallClock - lastPayload_.wallClock) * 1us / (lastPayload_.nextSequence - lastPayload_.sequence);
 		std::chrono::microseconds delta = (local.wallClock * 1us) - ((lastPayload_.wallClock * 1us) + frames * lastPayloadFrameDuration);
 		unsigned int mul = (delta + lastPayloadFrameDuration / 2) / lastPayloadFrameDuration;
-		std::chrono::microseconds delta_mod_1 = delta - mul * lastPayloadFrameDuration;
-		std::chrono::microseconds delta_mod = delta - 1* lastPayloadFrameDuration; 
+		delta_mod = delta - mul * lastPayloadFrameDuration;
 
-		if(frames == 0){
-			LOG(RPiSync, Info) << "Current frame : seq " << local.sequence << " ready countdown " << readyCountdown_;
+		if(syncReady_ && jitter < 5000 && !frames){
+
+			int y = delta_mod.count();
+			int x = local.sequence;
+			if(xpoints.size() == 100){
+				xpoints.pop_front();
+				ypoints.pop_front();
+			}
+			ypoints.push_back(y);
+			xpoints.push_back(x);
+			LOG(RPiSync, Info)<< " NEXT POINT	 " << y << "," << x << ","<< jitter;
+
+			LOG(RPiSync, Info) << " racun za trending "<<ypoints.front()<<"    "<< slope(xpoints, ypoints)<<"    " <<xpoints.size();
+			
+			trending = ypoints.front() + slope(xpoints, ypoints) * (xpoints.size() - 1) * syncPeriod_;
+			
+			LOG(RPiSync, Info) << "trendinggggggggggggggg  "<< trending;
+			
+			if(abs(trending) > 100 && xpoints.size() > 20){
+				state_ = State::Correcting;
+				ypoints = updating_trend(ypoints, trending);
+			}
 		}
-		/* SPAM
-			LOG(RPiSync, Info) << "Current frame : seq " << local.sequence << " ts " << local.wallClock << "us"
-				   << " frame offset " << frames << " est delta " << delta << " (mod) " << delta_mod << " ready countdown " << readyCountdown_;
-		*/
+
 		if (state_ == State::Correcting)  {
-			status.frameDurationOffset = delta_mod;
+			if(!xpoints.size()){
+				status.frameDurationOffset = delta_mod;
+				LOG(RPiSync, Info) << "CORRECTING SYNC " << delta_mod <<","<<local.sequence;
+			} else { 
+				status.frameDurationOffset = std::chrono::microseconds(trending);
+				LOG(RPiSync, Info) << " TRENDINGCORRECTED";
+			}
 			state_ = State::Stabilising;
-			LOG(RPiSync, Info) << "Correcting offset " << delta_mod_1;
 
 		} else if (state_ == State::Stabilising) {
-			status.frameDurationOffset = 0s;
-			/*LOG(RPiSync, Info) << "Stabilising duration ";*/		
+			status.frameDurationOffset = 0s;		
 			state_ = State::Idle;
 		}
 
-		if (!syncReady_ && readyCountdown_ && !(readyCountdown_ - frameCount_)) {
-			syncReady_ = true;
-			LOG(RPiSync, Info) << "Sync ready at frame " << frameCount_ << " ts " <<  payload.wallClock;
-		}		
-		if (syncReady_){
-			//out<< delta_mod << " " << local.sequence; 
-		}		
-
+		if (!syncReady_ && readyCountdown_ && !(readyCountdown_ - frameCount_ - 1)) {
+			if(syncCount_ > sufficientSync_){
+				syncReady_ = true;
+				//LOG(RPiSync, Info) << "Number of useful frmase: " << syncCount_;
+			} else {
+				LOG(RPiSync, Error) << "Insufficient number of useful frames!";
+				exit(0);
+			}	
+		}
 		frames++;
 	}
 
