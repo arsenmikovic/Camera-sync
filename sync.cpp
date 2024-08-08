@@ -28,6 +28,7 @@ constexpr unsigned int DefaultPort = 10000;
 constexpr unsigned int DefaultSyncPeriod = 30;
 constexpr unsigned int DefaultReadyFrame = 1000;
 constexpr unsigned int DefaultSufficientSync = 10;
+const char *DefaultUsingWallClock = "no";
 
 Sync::Sync(Controller *controller)
 	: SyncAlgorithm(controller), mode_(Mode::Off), socket_(-1), frameDuration_(0s), frameCount_(0)
@@ -69,6 +70,7 @@ int Sync::read(const libcamera::YamlObject &params)
 	syncPeriod_ = params["sync_period"].get<uint32_t>(DefaultSyncPeriod);
 	readyFrame_ = params["ready_frame"].get<uint32_t>(DefaultReadyFrame);
 	sufficientSync_ = params["sufficient_sync"].get<uint32_t>(DefaultSufficientSync);
+	usingWallClock_ = params["using_wall_clock"].get<std::string>(DefaultUsingWallClock);
 
 	return 0;
 }
@@ -127,7 +129,7 @@ void Sync::switchMode([[maybe_unused]] CameraMode const &cameraMode, [[maybe_unu
 	syncCount_ = 0;
 }
 
-ClockRecovery t;
+//ClockRecovery t;
 int sizecount =0;
 
 /* Most important part, algorithm*/
@@ -144,7 +146,7 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		return;
 	}
 
-	if (mode_ == Mode::Server) {
+	if (mode_ == Mode::Server && usingWallClock_ == "no") {
 		if (!syncReady_ && !(readyFrame_ - frameCount_)) {
 			LOG(RPiSync, Error) << "Sync ready at frame " << frameCount_ << " ts " <<  payload.wallClock;
 			syncReady_ = true;
@@ -163,15 +165,113 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 
 			//jitter without sensor timestmp
 			int jitter = payload.wallClock - nextSensorTimestamp;
+
 			nextSensorTimestamp = payload.nextWallClock;
 
 			if (sendto(socket_, &payload, sizeof(payload), 0, (const sockaddr *)&addr_, sizeof(addr_)) < 0)
 				LOG(RPiSync, Error) << "Send error! "<< strerror(errno);
-			else
+			else{
+				//LOG(RPiSync, Info) << "jitter "<< jitter << "," << local.sequence;
 				LOG(RPiSync, Info) << "Sent message: seq " << payload.sequence << " ts " << payload.wallClock << " jitter " << jitter << "us"
 						<< " : next seq " << payload.nextSequence << " ts " << payload.nextWallClock << " : ready frame " << payload.readyFrame;
+			}	
 		}
-	} else if (mode_ == Mode::Client) {
+	} else if (mode_ == Mode::Server && usingWallClock_ == "yes") {
+
+		static ClockRecovery trendingClock;
+
+		if (!syncReady_ && !(readyFrame_ - frameCount_)) {
+			LOG(RPiSync, Error) << "Sync ready at frame " << frameCount_ << " ts " <<  payload.wallClock;
+			LOG(RPiSync, Info) << "Using wall clock";
+			syncReady_ = true;
+		}
+
+		if (!(frameCount_ % syncPeriod_)) {
+			static int nextSensorTimestamp = local.wallClock;
+			payload.sequence = local.sequence;
+			payload.wallClock = trendingClock.modeled_wall_clock(local.wallClock, (local.sensorTimestamp)/1000, local.sequence);
+			payload.sensorTimestamp = local.sensorTimestamp;
+			payload.nextSequence = local.sequence + syncPeriod_;
+			payload.nextWallClock = payload.wallClock + frameDuration_.get<std::micro>() * syncPeriod_;
+			payload.readyFrame = std::max<int32_t>(0, readyFrame_ - frameCount_);
+
+			//jitter without sensor timestmp
+			int jitter = payload.wallClock - nextSensorTimestamp;
+
+			nextSensorTimestamp = payload.nextWallClock;
+
+			if (sendto(socket_, &payload, sizeof(payload), 0, (const sockaddr *)&addr_, sizeof(addr_)) < 0)
+				LOG(RPiSync, Error) << "Send error! "<< strerror(errno);
+			else{
+				//LOG(RPiSync, Info) << "jitter "<< jitter << "," << local.sequence;
+				LOG(RPiSync, Info) << "Sent message: seq " << payload.sequence << " ts " << payload.wallClock << " jitter " << jitter << "us"
+						<< " : next seq " << payload.nextSequence << " ts " << payload.nextWallClock << " : ready frame " << payload.readyFrame;
+			}
+		}
+	} else if (mode_ == Mode::Client && usingWallClock_ == "yes") {
+		static ClockRecovery trending_error;
+		static ClockRecovery trendingClock;
+		static int frames = 0;
+		socklen_t addrlen = sizeof(addr_);
+
+		while (true) {
+			//int64_t lastWallClock = lastPayload_.nextWallClock;
+			int ret = recvfrom(socket_, &lastPayload_, sizeof(lastPayload_), 0, (struct sockaddr *)&addr_, &addrlen);
+
+			if (ret > 0) {
+				//jitter = lastPayload_.wallClock - lastWallClock;
+				if(!syncReady_){
+					state_ = State::Correcting;
+					syncCount_++;
+				}
+				frames = 0;					
+
+				if (!syncReady_)
+					readyCountdown_ = lastPayload_.readyFrame + frameCount_;
+
+				} else
+					break;
+		}
+
+		/* Approximates frame duration */
+		std::chrono::microseconds lastPayloadFrameDuration = (lastPayload_.nextWallClock - lastPayload_.wallClock) * 1us / (lastPayload_.nextSequence - lastPayload_.sequence);
+		std::chrono::microseconds delta = (trendingClock.modeled_wall_clock(local.wallClock, local.sensorTimestamp, local.sequence) * 1us) - ((lastPayload_.wallClock * 1us));
+		unsigned int mul = (delta + lastPayloadFrameDuration / 2) / lastPayloadFrameDuration;
+		std::chrono::microseconds delta_mod = delta - mul * lastPayloadFrameDuration;
+
+		
+			
+		if(syncReady_ && !frames){
+			delta_mod = trending_error.trending_error((lastPayload_.wallClock * 1us ), (local.wallClock * 1us), lastPayloadFrameDuration, local.sequence);
+			if(abs(delta_mod) > 50us){
+				trending_error.updating_values(delta_mod);
+				state_ = State::Correcting;
+			}
+		}
+
+		if (state_ == State::Correcting)  {
+			//LOG(RPiSync, Info) <<"farem dur "<<lastPayloadFrameDuration<<" delta "<<delta;
+			status.frameDurationOffset = delta_mod;
+			state_ = State::Stabilising;
+			//LOG(RPiSync, Info) << "Correcting "<<delta_mod<<","<<local.sequence;
+
+		} else if (state_ == State::Stabilising) {
+			status.frameDurationOffset = 0s;		
+			state_ = State::Idle;
+		}
+
+		if (!syncReady_ && readyCountdown_ && !(readyCountdown_ - frameCount_ - 1)) {
+			if(syncCount_ > sufficientSync_){
+				syncReady_ = true;
+				LOG(RPiSync, Info) << "Using wall clock" ;
+			} else {
+				LOG(RPiSync, Error) << "Insufficient number of useful frames!";
+				exit(0);
+			}	
+		}
+		frames++;
+	} else if (mode_ == Mode::Client && usingWallClock_ == "no") {
+		static ClockRecovery trendig_error;
 		static int frames = 0;
 		socklen_t addrlen = sizeof(addr_);
 
@@ -203,21 +303,11 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		
 			
 		if(syncReady_ && !frames){
-			delta_mod = t.trending_error((lastPayload_.sensorTimestamp * 1us ) / 1000, (local.sensorTimestamp * 1us) / 1000, lastPayloadFrameDuration, local.sequence);
+			delta_mod = trendig_error.trending_error((lastPayload_.sensorTimestamp * 1us ) / 1000, (local.sensorTimestamp * 1us) / 1000, lastPayloadFrameDuration, local.sequence);
 			if(abs(delta_mod) > 50us){
-				t.updating_values(delta_mod);
+				trendig_error.updating_values(delta_mod);
 				state_ = State::Correcting;
 			}
-			/*
-			if(t.error_values.size() < 10){
-				t.updating_values(delta_mod);
-				startcount = 0;
-				state_ = State::Correcting;
-			} else if(startcount % 50 == 0){
-				t.updating_values(delta_mod);
-				state_ = State::Correcting;
-			}
-			*/
 		}
 
 		if (state_ == State::Correcting)  {
@@ -234,7 +324,6 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		if (!syncReady_ && readyCountdown_ && !(readyCountdown_ - frameCount_ - 1)) {
 			if(syncCount_ > sufficientSync_){
 				syncReady_ = true;
-				//LOG(RPiSync, Info) << "Number of useful frmase: " << syncCount_;
 			} else {
 				LOG(RPiSync, Error) << "Insufficient number of useful frames!";
 				exit(0);

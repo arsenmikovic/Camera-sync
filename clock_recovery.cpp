@@ -72,3 +72,27 @@ std::chrono::microseconds ClockRecovery::trending_error(std::chrono::microsecond
 	return std::chrono::microseconds(trending);
 }
 
+int64_t ClockRecovery::modeled_wall_clock(int64_t WallClock, int64_t KernelWallClock, unsigned int sequence){
+	
+	int64_t delta = WallClock - KernelWallClock;
+	
+	int y = delta;
+	int x = sequence;
+
+	if(error_values.size() == listSize){
+		xsum -= client_sequence.front() * 1.0;
+		ysum -= error_values.front() * 1.0;
+		xysum -= error_values.front() * client_sequence.front() * 1.0;
+		x2sum -= client_sequence.front() * client_sequence.front() * 1.0;
+
+		error_values.pop_front();
+		client_sequence.pop_front();
+	}
+	error_values.push_back(y);
+	client_sequence.push_back(x);
+
+	int trending = error_values.front() + slope() * (error_values.size() - 1) * syncPeriod;
+
+	return int64_t(trending + KernelWallClock);
+}
+

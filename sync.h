@@ -18,7 +18,9 @@ struct SyncPayload {
 	int64_t wallClock;
 	/* Capture sequence number */
 	uint64_t sequence;
+
 	uint64_t sensorTimestamp;
+	
 	/* Wall clock time for the next sync period */
 	int64_t nextWallClock;
 	/* Capture sequence number at the next sync period */
@@ -50,6 +52,7 @@ private:
 	uint32_t syncPeriod_;
 	uint32_t readyFrame_;
 	uint32_t sufficientSync_;
+	std::string usingWallClock_;
 
 	struct sockaddr_in addr_;
 	int socket_;

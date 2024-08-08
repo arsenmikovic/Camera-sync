@@ -14,6 +14,7 @@ class ClockRecovery {
 		unsigned int listSize = 100; 
 		void updating_values(std::chrono::microseconds delta);
 		std::chrono::microseconds trending_error(std::chrono::microseconds LastWallClock, std::chrono::microseconds ClientWallClock, std::chrono::microseconds lastPayloadFrameDuration, unsigned int sequence);
+		int64_t modeled_wall_clock(int64_t WallClock, int64_t KernelWallClock, unsigned int sequence);
 		//initializes the objects and sets sync period to the one of the sync class
 		ClockRecovery(unsigned int syncperiod, unsigned int listsize)
 		{
