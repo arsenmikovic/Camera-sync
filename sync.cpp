@@ -27,6 +27,7 @@ const char *DefaultGroup = "239.255.255.250";
 constexpr unsigned int DefaultPort = 10000;
 constexpr unsigned int DefaultSyncPeriod = 30;
 constexpr unsigned int DefaultReadyFrame = 1000;
+constexpr unsigned int DefaultLineFitting = 100;
 const char *DefaultUsingWallClock = "no";
 
 Sync::Sync(Controller *controller)
@@ -69,6 +70,7 @@ int Sync::read(const libcamera::YamlObject &params)
 	syncPeriod_ = params["sync_period"].get<uint32_t>(DefaultSyncPeriod);
 	readyFrame_ = params["ready_frame"].get<uint32_t>(DefaultReadyFrame);
 	usingWallClock_ = params["using_wall_clock"].get<std::string>(DefaultUsingWallClock);
+	lineFitting_ = params["line_fitting"].get<uint32_t>(DefaultLineFitting);
 
 	return 0;
 }
@@ -143,15 +145,37 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 
 	if (mode_ == Mode::Server) {
 
-		static ClockRecovery trendingClock(local.wallClock, local.sensorTimestamp, syncPeriod_, 100); 
-		//LOG(RPiSync, Error) << "wall clock  "<<local.wallClock<<" smth like ready frame "<<readyFrame_ - frameCount_<<" sent "<<local.sensorTimestamp;
-		if (!syncReady_ && !(readyFrame_ - frameCount_)) {
+		static ClockRecovery trendingClock(local.wallClock, local.sensorTimestamp, syncPeriod_, lineFitting_); 
+		
+		static int64_t lastWallClock = local.wallClock;
+
+		int mul = (local.wallClock - lastWallClock - frameDuration_.get<std::micro>() * 0.5) / frameDuration_.get<std::micro>();
+		if(mul > 0){
+			frameCount_ += mul;
+			//LOG(RPiSync, Info)<<"Differemce between frames is "<< local.wallClock - lastWallClock<<" multiplicator is "<<mul;
+		}
+		//LOG(RPiSync, Info)<<"Differemce between frames is "<< local.wallClock - lastWallClock<<" multiplicator is "<<mul;
+		lastWallClock = local.wallClock;
+
+		static std::chrono::microseconds syncTime = local.wallClock * 1us + (readyFrame_ - frameCount_)*1us * frameDuration_.get<std::micro>();
+
+		if (!syncReady_ && !(readyFrame_ - frameCount_) && local.wallClock *1us < syncTime +  frameDuration_.get<std::micro>() * 0.5 && local.wallClock *1us > syncTime -  frameDuration_.get<std::micro>() * 0.5) {
 			LOG(RPiSync, Error) << "Wall clock "<<  local.wallClock<< " the other thing "<<readyFrame_ - frameCount_ ;
 			syncReady_ = true;
 			if(usingWallClock_ == "yes"){
 					LOG(RPiSync, Error) << "using trending wall clock";
 					LOG(RPiSync, Error) << "Wall clock is "<< local.wallClock;
 				}
+		} else if (!syncReady_ && !(readyFrame_ - frameCount_) && local.wallClock *1us > syncTime +  frameDuration_.get<std::micro>() * 0.5){
+			LOG(RPiSync, Error) << "Wall clock "<<  local.wallClock<< " the other thing "<<readyFrame_ - frameCount_ ;
+			syncReady_ = true;
+			if(usingWallClock_ == "yes"){
+					LOG(RPiSync, Error) << "using trending wall clock";
+					LOG(RPiSync, Error) << "Wall clock is "<< local.wallClock;
+				}
+			//send metadataaa?????????????
+		} else{
+			syncTime = local.wallClock *1us + (readyFrame_ - frameCount_ - 1) * frameDuration_.get<std::micro>();
 		}
 
 		if (!(frameCount_ % syncPeriod_)) {
@@ -175,8 +199,8 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		}
 	} else if (mode_ == Mode::Client) {
 
-		static ClockRecovery trendig_error;
-		static ClockRecovery trendingClock(local.wallClock, local.sensorTimestamp, syncPeriod_, 100);
+		static ClockRecovery trendig_error(syncPeriod_, lineFitting_);
+		static ClockRecovery trendingClock(local.wallClock, local.sensorTimestamp, syncPeriod_, lineFitting_);
 		static int frames = 0;
 		socklen_t addrlen = sizeof(addr_);
 
@@ -215,7 +239,7 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 				if (!syncReady_)
 					readyCountdown_ = lastPayload_.readyFrame + frameCount_;
 				
-				if (lastPayload_.readyFrame <= syncPeriod_ && !syncReady_ && lastPayload_.readyFrame){
+				if (!syncReady_ && lastPayload_.readyFrame){
 					expected = lastPayload_.wallClock *1us + lastPayload_.readyFrame * lastPayloadFrameDuration;
 					LOG(RPiSync, Info) << "Expected sync  "<<expected;
 				}
@@ -247,6 +271,13 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 			LOG(RPiSync, Error) << "Sync ready is true";
 			LOG(RPiSync, Error) << "Wall clock is at sync is"<< local.wallClock;
 			trendingClock.clear();
+		} else if (!syncReady_ && readyCountdown_ && local.wallClock * 1us > expected+ lastPayloadFrameDuration/2 && expected != 0us){
+			syncReady_ = true;
+			LOG(RPiSync, Error) << "Sync ready is true";
+			LOG(RPiSync, Error) << "Wall clock is at sync is"<< local.wallClock;
+			trendingClock.clear();
+			//send metadata about the difference???????
+
 		}
 		frames++;
 	}
