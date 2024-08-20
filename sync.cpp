@@ -21,6 +21,49 @@ using namespace libcamera;
 
 LOG_DEFINE_CATEGORY(RPiSync)
 
+std::string local_adress()
+{
+    const char* google_dns_server = "8.8.8.8";
+    int dns_port = 53;
+
+    struct sockaddr_in serv;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    //Socket could not be created
+    if(sock < 0)
+    {
+        //std::cout << "Socket error" << std::endl;
+    }
+
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_addr.s_addr = inet_addr(google_dns_server);
+    serv.sin_port = htons(dns_port);
+
+    int err = connect(sock, (const struct sockaddr*)&serv, sizeof(serv));
+    if (err < 0)
+    {
+        //std::cout << "Error number: " << errno
+          //  << ". Error message: " << strerror(errno) << std::endl;
+    }
+
+    struct sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    err = getsockname(sock, (struct sockaddr*)&name, &namelen);
+
+    char buffer[80];
+    const char* p = inet_ntop(AF_INET, &name.sin_addr, buffer, 80);
+    if(p != NULL)
+    {
+        //LOG(RPiSync, Info)<<"IP         "<<buffer;
+    }
+    close(sock);
+	return buffer;
+}
+
+
+
+
 #define NAME "rpi.sync"
 
 const char *DefaultGroup = "239.255.255.250";
@@ -28,7 +71,6 @@ constexpr unsigned int DefaultPort = 10000;
 constexpr unsigned int DefaultSyncPeriod = 30;
 constexpr unsigned int DefaultReadyFrame = 1000;
 constexpr unsigned int DefaultLineFitting = 100;
-const char *DefaultUsingWallClock = "no";
 
 Sync::Sync(Controller *controller)
 	: SyncAlgorithm(controller), mode_(Mode::Off), socket_(-1), frameDuration_(0s), frameCount_(0)
@@ -69,7 +111,6 @@ int Sync::read(const libcamera::YamlObject &params)
 	port_ = params["port"].get<uint16_t>(DefaultPort);
 	syncPeriod_ = params["sync_period"].get<uint32_t>(DefaultSyncPeriod);
 	readyFrame_ = params["ready_frame"].get<uint32_t>(DefaultReadyFrame);
-	usingWallClock_ = params["using_wall_clock"].get<std::string>(DefaultUsingWallClock);
 	lineFitting_ = params["line_fitting"].get<uint32_t>(DefaultLineFitting);
 
 	return 0;
@@ -165,11 +206,12 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 				//LOG(RPiSync, Error) << "Wall clock "<<  local.wallClock<< " the other thing "<<readyFrame_ - frameCount_ ;
 				LOG(RPiSync, Error) << "Sync ready is true";
 				syncReady_ = true;
+				/*
 				if(usingWallClock_ == "yes"){
 						LOG(RPiSync, Error) << "using trending wall clock";
 						LOG(RPiSync, Error) << "Wall clock is "<< local.wallClock;
 					}
-
+				*/
 				lag = local.wallClock - syncTime;
 				if(local.wallClock > syncTime +  frameDuration_.get<std::micro>() * 0.5){
 					LOG(RPiSync, Warning) << "Frame has been lost, sync started with lag of: "<<lag<<" us";
@@ -205,6 +247,8 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 		static ClockRecovery trendingClock(local.wallClock, local.sensorTimestamp, syncPeriod_, lineFitting_);
 		static int frames = 0;
 		socklen_t addrlen = sizeof(addr_);
+		static std::string usingWallClock_ = "yes";
+		static bool IPCheck = false;
 
 		/* Approximates frame duration */
 		static int64_t modeled_wall_clock_value = 0;
@@ -218,6 +262,24 @@ void Sync::process([[maybe_unused]] StatisticsPtr &stats, Metadata *imageMetadat
 			int ret = recvfrom(socket_, &lastPayload_, sizeof(lastPayload_), 0, (struct sockaddr *)&addr_, &addrlen);
 
 			if (ret > 0) {
+
+				if (!IPCheck) {
+					char srcIP[INET_ADDRSTRLEN];
+					inet_ntop(AF_INET, &(addr_.sin_addr), srcIP, INET_ADDRSTRLEN);
+					std::string serverIP = srcIP;
+
+					static std::string clientIP = local_adress();
+
+					if (serverIP == clientIP) {
+						usingWallClock_ = "no";
+						LOG(RPiSync, Info) << "Using server time stamp ";
+					} else {
+						LOG(RPiSync, Info) << "Using modelled wall clock ";
+					}
+					LOG(RPiSync, Info) <<"Sever ip: " << serverIP << " client ip: " <<clientIP; 
+					IPCheck = true;
+				}
+				
 				if(!syncReady_){
 					state_ = State::Correcting;
 					//LOG(RPiSync, Error) << "Received";
